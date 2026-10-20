@@ -9,7 +9,7 @@ $env:RESUMEGRABBER_HOME = Join-Path $sandbox 'home'
 $script:fail = 0; $script:pass = 0
 function Assert($cond, [string]$name) {
     if ($cond) { $script:pass++; Write-Host "  PASS  $name" -ForegroundColor Green }
-    else { $script:fail++; Write-Host "  FAIL  $name" -ForegroundColor Red }
+    else { $script:fail++; Write-Host "  FAIL  $name" -ForegroundColor Red; if ($env:GITHUB_ACTIONS) { Write-Host "::error::FAIL $name" } }
 }
 
 try {
@@ -91,6 +91,11 @@ self.onmessage = (e) => {
             $img.Dispose()
         }
     }
+} catch {
+    $script:fail++
+    $msg = "$($_.Exception.Message) @ line $($_.InvocationInfo.ScriptLineNumber) in $($_.InvocationInfo.ScriptName)"
+    Write-Host "  ERROR $msg" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS) { Write-Host "::error::$($PSVersionTable.PSVersion) $msg" }
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
