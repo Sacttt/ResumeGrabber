@@ -68,6 +68,9 @@ function ConvertTo-RGPagePngs {
         } finally { $page.Dispose() }
     }
     $ras.Dispose(); $netStream.Dispose()
+    # Release WinRT objects now, on this thread; leaving them for process shutdown can crash powershell.exe.
+    $doc = $null; $page = $null; $opts = $null
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect()
     return $out
 }
 

@@ -20,13 +20,18 @@ jobs:
           if ($bad) { exit 1 }
       - name: Self-tests (Windows PowerShell 5.1)
         shell: powershell
-        env:
-          RG_TRACE: '1'
         run: |
-          ./tests/Run-Tests.ps1 *>&1 | Tee-Object -FilePath out.txt
-          $code = $LASTEXITCODE
-          Get-Content out.txt | Where-Object { $_ -match "png|XAML|ERROR|FAIL|passed|PDF page|stacks" } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice::$_" }
-          exit $code
+          $p = Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','tests/Run-Tests.ps1' -Wait -PassThru -NoNewWindow
+          Write-Host "::notice::self-tests exit code $($p.ExitCode)"
+          exit $p.ExitCode
+      - name: PNG step exits cleanly
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 3; $i++) {
+            $p = Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-STA','-File','tests/png-exit.ps1' -Wait -PassThru -NoNewWindow
+            Write-Host "::notice::run $i exit code $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { exit 1 }
+          }
       - name: Self-tests (PowerShell 7)
         shell: pwsh
         run: ./tests/Run-Tests.ps1
