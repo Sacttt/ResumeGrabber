@@ -309,11 +309,11 @@ function Complete-Job {
             return
         }
         $UI.Ready = $true
-        $W.CardNodeTitle.Text = "Node.js $($s.NodeVer)"
+        $W.CardNodeTitle.Text = "Node.js " + ($s.NodeVer -replace '^v(\d+).*$', '$1')
         $where = 'temporary copy'; if ($s.Node -notlike "$SessionDir*") { $where = 'already on this PC' }
         $W.CardNodeSub.Text = $where
         $W.CardEngineTitle.Text = 'Ready'
-        $W.CardEngineSub.Text = $(if ($s.Offline) { 'cached engine' } else { "resume.io $($s.Engine)" })
+        $W.CardEngineSub.Text = $(if ($s.Offline) { 'cached engine' } else { 'resume.io engine' })
         if ($UI.PendingRender) { $UI.PendingRender = $false; Request-Render }
         elseif (-not $UI.Json) { Set-Status 'Ready. Start with step 1 - or drop a resume .json on this window.' 'ok' }
         return
@@ -424,7 +424,7 @@ $jobTimer.Add_Tick({
     $s = $script:Job.Sync
     if ($script:Job.Kind -eq 'prepare') {
         if ($s.Phase -eq 'node') { $W.CardNodeTitle.Text = 'Setting up...' }
-        if ($s.Phase -eq 'engine') { $W.CardNodeTitle.Text = "Node.js $($s.NodeVer)"; $W.CardEngineTitle.Text = 'Downloading...' }
+        if ($s.Phase -eq 'engine') { $W.CardNodeTitle.Text = 'Node.js ready'; $W.CardEngineTitle.Text = 'Downloading...' }
     }
     if ($s.Status -and $W.StatusText.Text -ne $s.Status -and ($script:Job.Kind -eq 'render' -or -not $UI.Json)) { Set-Status ($s.Status + '...') 'busy' }
     if ($s.Done) { Complete-Job }
@@ -448,6 +448,12 @@ $clipTimer.Add_Tick({
 })
 
 $window.Add_Loaded({
+    # Fit small screens (e.g. 1366x768 laptops).
+    $wa = [Windows.SystemParameters]::WorkArea
+    if ($window.Width -gt $wa.Width * 0.95) { $window.Width = [Math]::Floor($wa.Width * 0.95) }
+    if ($window.Height -gt $wa.Height * 0.95) { $window.Height = [Math]::Floor($wa.Height * 0.95) }
+    $window.Left = $wa.Left + ($wa.Width - $window.Width) / 2
+    $window.Top = $wa.Top + ($wa.Height - $window.Height) / 2
     $UI.LastClip = Get-ClipText   # ignore whatever was on the clipboard before the app opened
     Set-Status 'Getting ready - downloading the renderer into a temporary folder...' 'busy'
     Start-RGJob 'prepare'

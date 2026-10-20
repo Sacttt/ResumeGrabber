@@ -61,6 +61,12 @@ jobs:
           New-Item -ItemType Directory -Force screens | Out-Null
           $bmp.Save("$PWD\screens\app.png")
           Write-Host "::notice::screen $($b.Width)x$($b.Height); data dir exists while running: $(Test-Path (Join-Path $session 'data'))"
+          # Simulate step 3: copy a (made-up) resume document and let the app auto-create the PNG.
+          Set-Clipboard -Value '{"id":4242,"renderingToken":"ciTestToken","template":"sydney","locale":"en","firstName":"Jane","lastName":"Doe","jobTitle":"QA Engineer","color":"#1a91f0","sections":[]}'
+          Start-Sleep -Seconds 40
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD\screens\after.png")
+          Get-ChildItem "$env:USERPROFILE\Downloads" -Filter *.png -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "::notice::saved $($_.Name) $($_.Length) bytes"; Copy-Item $_.FullName "$PWD\screens\result.png" }
           $p.Refresh(); Write-Host "::notice::exited early: $($p.HasExited) code $(if ($p.HasExited) { $p.ExitCode })"
           [void]$p.CloseMainWindow()
           if (-not $p.WaitForExit(30000)) { Write-Host '::warning::app did not close, killing'; $p.Kill() }
@@ -71,10 +77,10 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path screens/app.png)) { exit 0 }
-          Copy-Item screens/app.png $env:RUNNER_TEMP/app.png
+          Copy-Item screens/*.png $env:RUNNER_TEMP/
           git config user.name ci; git config user.email ci@users.noreply.github.com
           git checkout --orphan ci-screens
           git rm -rf -q .
-          Copy-Item $env:RUNNER_TEMP/app.png app.png
-          git add app.png; git commit -q -m "screenshot ${{ github.sha }}"
+          Copy-Item $env:RUNNER_TEMP/*.png .
+          git add *.png; git commit -q -m "screenshot ${{ github.sha }}"
           git push -f origin ci-screens
