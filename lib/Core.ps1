@@ -3,7 +3,7 @@
 
 Set-StrictMode -Version 2.0
 
-$script:RG_VERSION    = '2.0.0'
+$script:RG_VERSION    = '3.0.0'
 $script:RG_REPO       = 'Sacttt/ResumeGrabber'
 $script:RG_ORIGIN     = 'https://resume.io'
 $script:RG_UA         = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
@@ -192,15 +192,16 @@ function Install-RGNode {
     $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
     if ($expected -ne $actual) { Remove-Item -LiteralPath $zip -Force; throw 'Node.js download failed checksum verification.' }
 
-    & $OnStatus 'Unpacking'
-    $unpack = Join-Path $tmp 'node-unpack'
-    if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force }
-    Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
-    $inner = Get-ChildItem -LiteralPath $unpack -Directory | Select-Object -First 1
+    & $OnStatus 'Unpacking Node.js'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
     $dest = Get-RGPath 'node'
-    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-    Move-Item -LiteralPath $inner.FullName -Destination $dest
-    Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    $za = [IO.Compression.ZipFile]::OpenRead($zip)
+    try {
+        $entry = $za.Entries | Where-Object { $_.FullName -match '^[^/]+/node\.exe$' } | Select-Object -First 1
+        if (-not $entry) { throw 'node.exe not found in the Node.js archive.' }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $dest 'node.exe'), $true)
+    } finally { $za.Dispose() }
     Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
     Write-RGLog "installed portable node $ver"
     return (Join-Path $dest 'node.exe')

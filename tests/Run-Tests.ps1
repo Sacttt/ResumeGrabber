@@ -54,6 +54,43 @@ self.onmessage = (e) => {
     } else {
         Write-Host '  SKIP  end-to-end render (Node.js not installed)' -ForegroundColor Yellow
     }
+
+    if ($env:OS -eq 'Windows_NT') {
+        # --- the window's XAML loads
+        Add-Type -AssemblyName PresentationFramework
+        $xaml = [IO.File]::ReadAllText((Join-Path (Join-Path $root 'ui') 'MainWindow.xaml'))
+        $win = [Windows.Markup.XamlReader]::Parse($xaml)
+        $names = [regex]::Matches($xaml, 'x:Name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+        Assert ((@($names | Where-Object { -not $win.FindName($_) })).Count -eq 0) 'window XAML parses and every named element exists'
+
+        # --- PDF -> PNG with Windows' renderer (needs Windows PowerShell 5.1)
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            . (Join-Path (Join-Path $root 'lib') 'Png.ps1')
+            $objs = @(
+                '<< /Type /Catalog /Pages 2 0 R >>',
+                '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+                '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>',
+                '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>'
+            )
+            $sb = New-Object Text.StringBuilder
+            [void]$sb.Append("%PDF-1.4`n")
+            $offsets = @()
+            for ($i = 0; $i -lt $objs.Count; $i++) { $offsets += $sb.Length; [void]$sb.Append("$($i + 1) 0 obj`n$($objs[$i])`nendobj`n") }
+            $xref = $sb.Length
+            [void]$sb.Append("xref`n0 $($objs.Count + 1)`n0000000000 65535 f `n")
+            foreach ($o in $offsets) { [void]$sb.Append(('{0:D10} 00000 n `n' -f $o)) }
+            [void]$sb.Append("trailer`n<< /Size $($objs.Count + 1) /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
+            $pdf = Join-Path $sandbox 'two.pdf'
+            [IO.File]::WriteAllText($pdf, $sb.ToString(), [Text.Encoding]::ASCII)
+            $pngs = @(ConvertTo-RGPagePngs -PdfPath $pdf -OutDir (Join-Path $sandbox 'png') -Dpi 96)
+            Assert ($pngs.Count -eq 2) 'renders each PDF page to PNG'
+            $joined = Join-RGPngs -Pages $pngs -OutFile (Join-Path $sandbox 'all.png')
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($joined)
+            Assert ($img.Height -gt 1584 -and $img.Width -ge 816) 'stacks pages into one image'
+            $img.Dispose()
+        }
+    }
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }

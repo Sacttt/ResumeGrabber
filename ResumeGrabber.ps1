@@ -1,504 +1,474 @@
 <#
 .SYNOPSIS
-    ResumeGrabber - turn your resume.io resume into a pixel-perfect, multi-page vector PDF.
+    ResumeGrabber - portable app that turns your resume.io resume into a PNG.
 
 .DESCRIPTION
-    Runs resume.io's own rendering engine locally with a portable Node.js runtime.
-    No Docker, no Python, no admin rights. Run without arguments for the interactive app.
+    Nothing is installed. Everything (portable Node.js, resume.io's renderer, temp files) lives in a
+    temporary session folder that is deleted when the window closes. Only your PNG stays.
 
-.EXAMPLE
-    resumegrabber                         # interactive app
-    resumegrabber resume.json             # convert one file
-    resumegrabber *.json -Out C:\CVs      # convert many into a folder
-    resumegrabber -Clipboard -Open        # convert the JSON you just copied, then open it
-    resumegrabber -Watch                  # auto-convert every resume JSON you download/copy
-    resumegrabber -Doctor                 # diagnose problems
+    Normally started by run.ps1:
+        irm https://raw.githubusercontent.com/Sacttt/ResumeGrabber/main/run.ps1 | iex
 #>
-[CmdletBinding()]
-param(
-    [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Path,
-    [Alias('o')][string]$Out,
-    [string]$Locale,
-    [switch]$Clipboard,
-    [switch]$Watch,
-    [switch]$Open,
-    [switch]$Doctor,
-    [switch]$Update,
-    [switch]$RefreshEngine,
-    [switch]$Version,
-    [switch]$Quiet
-)
+param([string]$SessionDir)
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path (Join-Path $PSScriptRoot 'lib') 'Core.ps1')
-. (Join-Path (Join-Path $PSScriptRoot 'lib') 'UI.ps1')
+if ($env:OS -ne 'Windows_NT') { throw 'ResumeGrabber is a Windows app.' }
+if ($PSVersionTable.PSVersion.Major -gt 5 -or [Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    # WPF needs STA and the PDF->PNG step needs Windows PowerShell 5.1 (WinRT): relaunch there.
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+    if ($SessionDir) { $argList += @('-SessionDir', "`"$SessionDir`"") }
+    Start-Process -FilePath $ps -ArgumentList $argList -WindowStyle Hidden -Wait
+    return
+}
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+trap {
+    try { [void][Windows.MessageBox]::Show("ResumeGrabber hit an error:`n`n$($_.Exception.Message)", 'ResumeGrabber', 'OK', 'Error') } catch { }
+    break
+}
+
+$Root = $PSScriptRoot
+$OwnsSession = $false
+if (-not $SessionDir) {
+    $SessionDir = Join-Path $env:TEMP ('ResumeGrabber-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+    $OwnsSession = $true
+}
+if (-not (Test-Path -LiteralPath $SessionDir)) { New-Item -ItemType Directory -Path $SessionDir -Force | Out-Null }
+$env:RESUMEGRABBER_HOME = Join-Path $SessionDir 'data'
+
+. (Join-Path (Join-Path $Root 'lib') 'Core.ps1')
 Initialize-RGDirs
 
-# ================================================================= shared actions
-function Convert-RGJson {
-    param([string]$JsonText, [string]$Label, [string]$OutPath, [switch]$OpenAfter, [switch]$NoOpen)
-    $settings = Get-RGSettings
+# ======================================================================= window
+$xaml = [IO.File]::ReadAllText((Join-Path (Join-Path $Root 'ui') 'MainWindow.xaml'))
+$window = [Windows.Markup.XamlReader]::Parse($xaml)
+$W = @{}
+foreach ($m in [regex]::Matches($xaml, 'x:Name="([^"]+)"')) { $W[$m.Groups[1].Value] = $window.FindName($m.Groups[1].Value) }
+
+$UI = @{
+    Json = $null; Info = $null; JsonHash = ''; RenderedHash = ''
+    Ready = $false; PendingRender = $false
+    LastClip = ''; Saved = 0; LastPng = $null; LastFiles = @()
+    OutDir = (Get-DownloadsDir); Tick = 0
+}
+$script:Job = $null
+
+$Brush = @{
+    Accent = [Windows.Media.BrushConverter]::new().ConvertFrom('#4CC2FF')
+    Green  = [Windows.Media.BrushConverter]::new().ConvertFrom('#6CCB5F')
+    Red    = [Windows.Media.BrushConverter]::new().ConvertFrom('#FF6B6B')
+    Yellow = [Windows.Media.BrushConverter]::new().ConvertFrom('#FCE100')
+    DoneBg = [Windows.Media.BrushConverter]::new().ConvertFrom('#16301F')
+}
+$IconFont = New-Object Windows.Media.FontFamily 'Segoe Fluent Icons, Segoe MDL2 Assets'
+
+# ======================================================================= helpers
+function Set-Status([string]$Text, [string]$Kind = 'info') {
+    $W.StatusText.Text = $Text
+    switch ($Kind) {
+        'ok'    { $W.StatusIcon.Text = [string][char]0xE73E; $W.StatusIcon.Foreground = $Brush.Green }
+        'error' { $W.StatusIcon.Text = [string][char]0xE783; $W.StatusIcon.Foreground = $Brush.Red }
+        'warn'  { $W.StatusIcon.Text = [string][char]0xE7BA; $W.StatusIcon.Foreground = $Brush.Yellow }
+        'busy'  { $W.StatusIcon.Text = [string][char]0xE895; $W.StatusIcon.Foreground = $Brush.Accent }
+        default { $W.StatusIcon.Text = [string][char]0xE946; $W.StatusIcon.Foreground = $Brush.Accent }
+    }
+}
+
+function Set-StepDone([int]$N, [string]$Text) {
+    $glyph = $W["Step${N}Glyph"]; $num = $W["Step${N}Num"]
+    $glyph.FontFamily = $IconFont; $glyph.Text = [string][char]0xE73E; $glyph.Foreground = $Brush.Green
+    $num.Background = $Brush.DoneBg
+    if ($Text) { $W["Step${N}Text"].Text = $Text }
+}
+
+function Get-Dpi {
+    if ($W.Q150.IsChecked) { return 150 }
+    if ($W.Q300.IsChecked) { return 300 }
+    return 220
+}
+
+function Get-Layout {
+    if ($W.LayoutPages.IsChecked) { return 'pages' }
+    if ($W.LayoutBoth.IsChecked) { return 'both' }
+    return 'one'
+}
+
+function Update-Cards {
+    $W.CardOutTitle.Text = Split-Path -Leaf $UI.OutDir
+    $W.CardOutSub.Text = $UI.OutDir
+    $W.OutDirText.Text = $UI.OutDir
+    $q = switch (Get-Dpi) { 150 { 'Standard' } 300 { 'Print' } default { 'High' } }
+    $W.CardFmtTitle.Text = "PNG - $q"
+    $l = switch (Get-Layout) { 'pages' { 'one PNG per page' } 'both' { 'combined + per page' } default { 'all pages in one image' } }
+    $pdf = ''; if ($W.AlsoPdfChk.IsChecked) { $pdf = ' + PDF' }
+    $W.CardFmtSub.Text = "{0} DPI, {1}{2}" -f (Get-Dpi), $l, $pdf
+}
+
+function Get-ClipText {
+    try { if ([Windows.Clipboard]::ContainsText()) { return [Windows.Clipboard]::GetText() } } catch { }
+    return ''
+}
+
+function Get-TextHash([string]$Text) {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))) } finally { $sha.Dispose() }
+}
+
+function Show-ResumeList($List) {
+    $W.ResumeList.Children.Clear()
+    foreach ($r in $List) {
+        $title = $null
+        foreach ($k in 'name', 'title') { if (-not $title -and $r.PSObject.Properties[$k] -and $r.$k) { $title = [string]$r.$k } }
+        if (-not $title) { $title = "Resume $($r.id)" }
+        $sub = "ID $($r.id)"
+        foreach ($k in 'updatedAt', 'updated_at') {
+            if ($r.PSObject.Properties[$k] -and $r.$k) { $d = [string]$r.$k; $sub = 'Updated ' + $d.Substring(0, [Math]::Min(10, $d.Length)) }
+        }
+        $btn = New-Object Windows.Controls.Button
+        $btn.Style = $window.FindResource('Btn')
+        $btn.Margin = '0,6,10,4'; $btn.Padding = '16,10'; $btn.MinWidth = 210
+        $btn.HorizontalContentAlignment = 'Left'
+        $btn.Tag = [string]$r.id
+        $sp = New-Object Windows.Controls.StackPanel
+        $sp.HorizontalAlignment = 'Left'
+        $t1 = New-Object Windows.Controls.TextBlock; $t1.Text = $title; $t1.FontWeight = 'SemiBold'; $t1.FontSize = 15
+        $t2 = New-Object Windows.Controls.TextBlock; $t2.Text = $sub; $t2.FontSize = 12; $t2.Foreground = $window.FindResource('Sub')
+        [void]$sp.Children.Add($t1); [void]$sp.Children.Add($t2)
+        $btn.Content = $sp
+        $btn.Add_Click({
+            param($s, $e)
+            Start-Process ("https://resume.io/api/app/resumes/" + $s.Tag)
+            $W.Step3Text.Text = 'Now press Ctrl+A, Ctrl+C on the page that just opened.'
+            Set-Status "Opened resume $($s.Tag) - copy that page (Ctrl+A, Ctrl+C)." 'busy'
+        })
+        [void]$W.ResumeList.Children.Add($btn)
+    }
+}
+
+function Set-Detected([string]$Json, [string]$Source) {
+    $info = Get-RGResumeInfo $Json
+    $UI.Json = $Json; $UI.Info = $info; $UI.JsonHash = Get-TextHash $Json
+    $name = $info.Name; if (-not $name) { $name = $info.DocName }; if (-not $name) { $name = 'Your resume' }
+    $W.DetectedName.Text = $name
+    $bits = @($info.Title, $(if ($info.Template) { "template: $($info.Template)" }), $(if ($info.Locale) { "language: $($info.Locale)" })) | Where-Object { $_ }
+    $W.DetectedSub.Text = ($bits -join '   |   ')
+    $W.DetectedCard.Visibility = 'Visible'
+    $W.CreateBtn.IsEnabled = $true
+    Set-StepDone 1; Set-StepDone 2; Set-StepDone 3 'Got it!'
+    Set-Status "Resume found: $name" 'ok'
+    return $true
+}
+
+function Receive-JsonText([string]$Text, [string]$Source, [switch]$UserAction) {
+    $json = Get-JsonFromText $Text
+    if (-not $json) {
+        if ($UserAction) { Set-Status 'That is not JSON. Copy the whole resume.io page (Ctrl+A, Ctrl+C).' 'warn' }
+        return
+    }
+    $obj = ConvertFrom-RGJson $json
+    if (Test-RGResumeDoc $obj) {
+        [void](Set-Detected $json $Source)
+        $isNew = ((Get-TextHash $json) -ne $UI.RenderedHash)
+        if ($UserAction -or ($W.AutoCreateChk.IsChecked -and $isNew)) { Request-Render }
+        return
+    }
+    $list = @()
+    if ($obj -is [array]) { $list = $obj } else { foreach ($p in $obj.PSObject.Properties) { if ($p.Value -is [array]) { $list = $p.Value; break } } }
+    $list = @($list | Where-Object { $_ -is [Management.Automation.PSCustomObject] -and $_.PSObject.Properties['id'] })
+    if ($list.Count -gt 0) {
+        Show-ResumeList $list
+        Set-StepDone 1
+        $W.Step2Text.Text = "Found $($list.Count) resume(s). Click the one you want - it opens in your browser."
+        Set-Status "Found $($list.Count) resume(s). Pick one in step 2." 'ok'
+        if ($list.Count -eq 1) {
+            Start-Process ("https://resume.io/api/app/resumes/" + $list[0].id)
+            Set-StepDone 2 'Only one resume - opened it for you.'
+            $W.Step3Text.Text = 'Now press Ctrl+A, Ctrl+C on the page that just opened.'
+        }
+        return
+    }
+    if ($UserAction) { Set-Status "This JSON isn't a resume.io resume." 'warn' }
+}
+
+# ======================================================================= background jobs
+$JobScript = {
+    param($Root, $DataHome, $Kind, $P, $Sync)
+    $ErrorActionPreference = 'Stop'
+    $env:RESUMEGRABBER_HOME = $DataHome
     try {
-        $info = Get-RGResumeInfo $JsonText
-        $who = @($info.Name, $info.Title) | Where-Object { $_ }
-        if ($who) { Write-Step ("Resume: " + ($who -join '  |  ')) } else { Write-Step "Resume: $Label" }
-        Backup-RGJson $JsonText $info
-        $r = Invoke-RGRender -JsonText $JsonText -OutPath $OutPath -Locale $Locale -SourceLabel $Label `
-                -OnStatus { param($m) Write-Step $m } -OnTick { Step-Spinner }
-        Stop-Spinner
-        if ($r.Offline) { Write-Warn 'resume.io was unreachable for discovery - used the cached engine.' }
-        Write-Ok ("{0} page(s), {1} KB in {2}s" -f $r.Pages, $r.SizeKB, $r.Seconds)
-        Write-C '        ' 'Gray' -NoNewline; Write-C $r.Output 'Cyan'
-        if (-not $NoOpen -and ($OpenAfter -or $settings.OpenAfterRender)) { Open-RGItem $r.Output }
-        return $r
+        . (Join-Path (Join-Path $Root 'lib') 'Core.ps1')
+        . (Join-Path (Join-Path $Root 'lib') 'Png.ps1')
+        $st = { param($m) $Sync.Status = $m }
+        if ($Kind -eq 'prepare') {
+            $Sync.Phase = 'node'
+            $node = Get-RGNode -OnStatus $st
+            $Sync.Node = $node
+            $Sync.NodeVer = [string](& $node --version)
+            $Sync.Phase = 'engine'
+            $b = Get-RGBundle -OnStatus $st
+            $Sync.Engine = $b.Entry
+            $Sync.Offline = $b.Offline
+        } else {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $tmp = Get-RGPath 'tmp'
+            $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
+            $pdf = Join-Path $tmp "resume-$id.pdf"
+            $null = Invoke-RGRender -JsonText $P.Json -OutPath $pdf -Locale $P.Locale -OnStatus $st
+            $pages = @(ConvertTo-RGPagePngs -PdfPath $pdf -OutDir (Join-Path $tmp "pages-$id") -Dpi $P.Dpi -OnStatus $st)
+            & $st 'Saving PNG'
+            $combined = Join-Path $tmp "combined-$id.png"
+            $null = Join-RGPngs -Pages $pages -OutFile $combined
+
+            if (-not (Test-Path -LiteralPath $P.OutDir)) { New-Item -ItemType Directory -Path $P.OutDir -Force | Out-Null }
+            $base = Get-RGOutputName (Get-RGResumeInfo $P.Json) '{name} - {title} - Resume'
+            $files = @(); $primary = $null
+            if ($P.Layout -ne 'pages' -or $pages.Count -eq 1) {
+                $target = Get-UniquePath (Join-Path $P.OutDir "$base.png")
+                Copy-Item -LiteralPath $combined -Destination $target
+                $files += $target; $primary = $target
+            }
+            if ($P.Layout -ne 'one' -and $pages.Count -gt 1) {
+                for ($i = 0; $i -lt $pages.Count; $i++) {
+                    $target = Get-UniquePath (Join-Path $P.OutDir ("{0} - Page {1}.png" -f $base, ($i + 1)))
+                    Copy-Item -LiteralPath $pages[$i] -Destination $target
+                    $files += $target
+                    if (-not $primary) { $primary = $target }
+                }
+            }
+            if ($P.AlsoPdf) {
+                $target = Get-UniquePath (Join-Path $P.OutDir "$base.pdf")
+                Copy-Item -LiteralPath $pdf -Destination $target
+                $files += $target
+            }
+            $Sync.Result = @{ Primary = $primary; Files = $files; Preview = $combined; Pages = $pages.Count; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+        }
     } catch {
-        Write-Err ($_.Exception.Message)
-        Write-RGLog "convert failed ($Label): $($_.Exception.Message)"
-        return $null
+        $Sync.Error = $_.Exception.Message
+    } finally {
+        $Sync.Done = $true
     }
 }
 
-function Backup-RGJson([string]$JsonText, $Info) {
-    try {
-        $dir = Join-Path (Get-RGHome) 'resumes'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $id = $Info.Id; if (-not $id) { $id = $Info.Token }; if (-not $id) { $id = 'resume' }
-        Write-Utf8NoBom (Join-Path $dir ((ConvertTo-SafeFileName $id) + '.json')) $JsonText
-    } catch { }
+function Start-RGJob([string]$Kind, [hashtable]$Params = @{}) {
+    $sync = [hashtable]::Synchronized(@{ Status = ''; Done = $false; Error = $null; Result = $null; Phase = '' })
+    $rs = [RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = 'MTA'
+    $rs.Open()
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($JobScript).AddArgument($Root).AddArgument($env:RESUMEGRABBER_HOME).AddArgument($Kind).AddArgument($Params).AddArgument($sync)
+    $script:Job = @{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke(); Sync = $sync; Kind = $Kind }
+    $W.Busy.Visibility = 'Visible'
 }
 
-function Convert-RGFile([string]$File, [string]$OutPath, [switch]$OpenAfter, [switch]$NoOpen) {
-    $full = (Resolve-Path -LiteralPath $File).Path
-    $text = [IO.File]::ReadAllText($full)
-    $json = Get-JsonFromText $text
-    if (-not $json) { Write-Err "$([IO.Path]::GetFileName($full)) is not valid JSON."; return $null }
-    return (Convert-RGJson -JsonText $json -Label ([IO.Path]::GetFileName($full)) -OutPath $OutPath -OpenAfter:$OpenAfter -NoOpen:$NoOpen)
+function Request-Render {
+    if (-not $UI.Json) { Set-Status 'Copy or open a resume first.' 'warn'; return }
+    if ($script:Job -and $script:Job.Kind -eq 'render') { return }
+    if (-not $UI.Ready) {
+        $UI.PendingRender = $true
+        Set-Status 'Will create your PNG as soon as the renderer is ready...' 'busy'
+        return
+    }
+    $W.CreateBtn.IsEnabled = $false; $W.DetectedCreateBtn.IsEnabled = $false
+    Set-Status 'Creating your PNG...' 'busy'
+    $UI.RenderedHash = $UI.JsonHash
+    Start-RGJob 'render' @{
+        Json = $UI.Json; Locale = $W.LocaleBox.Text.Trim(); Dpi = (Get-Dpi); Layout = (Get-Layout)
+        OutDir = $UI.OutDir; AlsoPdf = [bool]$W.AlsoPdfChk.IsChecked
+    }
 }
 
-function Get-RGClipboardText {
-    try { return (Get-Clipboard -Raw -ErrorAction Stop) } catch { }
-    try { return ((Get-Clipboard -ErrorAction Stop) -join "`n") } catch { return '' }
+function Show-Preview([string]$Path, $Result) {
+    $bmp = New-Object Windows.Media.Imaging.BitmapImage
+    $bmp.BeginInit()
+    $bmp.CacheOption = 'OnLoad'
+    $bmp.CreateOptions = 'IgnoreImageCache'
+    $bmp.UriSource = New-Object Uri $Path
+    $bmp.EndInit(); $bmp.Freeze()
+    $W.PreviewImage.Source = $bmp
+    $W.PreviewEmpty.Visibility = 'Collapsed'
+    $W.PreviewActions.IsEnabled = $true
+    $W.PreviewPath.Text = "{0}   -   {1} page(s), {2}s" -f $Result.Primary, $Result.Pages, $Result.Seconds
+    $W.PreviewBadge.Visibility = 'Visible'
+    $W.PreviewBadgeText.Text = [string]$Result.Pages
+    $W.NavPreview.IsChecked = $true
 }
 
-function Wait-RGClipboardJson {
-    <# Polls the clipboard until it holds JSON that passes $Accept. Esc cancels. #>
-    param([scriptblock]$Accept, [string]$Waiting = 'Waiting for you to copy the page')
-    $initial = Get-RGClipboardText
-    $frames = @('.  ', '.. ', '...', '   '); $i = 0
-    while ($true) {
-        if ($script:RG_Interactive -and [Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true)
-            if ($k.Key -eq 'Escape' -or $k.KeyChar -eq 'q') { Write-Host ''; return $null }
+function Complete-Job {
+    $j = $script:Job; $script:Job = $null
+    try { [void]$j.PS.EndInvoke($j.Handle) } catch { }
+    $j.PS.Dispose(); $j.RS.Dispose()
+    $W.Busy.Visibility = 'Collapsed'
+    $s = $j.Sync
+    if ($j.Kind -eq 'prepare') {
+        if ($s.Error) {
+            $W.CardNodeTitle.Text = 'Problem'; $W.CardEngineTitle.Text = 'Not ready'
+            $W.CardEngineSub.Text = 'see status bar'
+            Set-Status "Couldn't get ready: $($s.Error)  (check your internet, then reopen the app)" 'error'
+            return
         }
-        $now = Get-RGClipboardText
-        if ($now -and $now -ne $initial) {
-            $json = Get-JsonFromText $now
-            if ($json) {
-                $obj = ConvertFrom-RGJson $json
-                if (& $Accept $obj) { Write-Host ("`r" + (' ' * 70) + "`r") -NoNewline; return $json }
-            }
-            $initial = $now
-            Write-Host ''
-            Write-Warn "That's not the right page yet - copy it again (Ctrl+A, Ctrl+C)."
-        }
-        if ($script:RG_Interactive) {
-            Write-Host ("`r   {0}{1}   (Esc to cancel)" -f $Waiting, $frames[$i % 4]) -ForegroundColor Magenta -NoNewline
-        }
-        $i++
-        Start-Sleep -Milliseconds 400
+        $UI.Ready = $true
+        $W.CardNodeTitle.Text = "Node.js $($s.NodeVer)"
+        $where = 'temporary copy'; if ($s.Node -notlike "$SessionDir*") { $where = 'already on this PC' }
+        $W.CardNodeSub.Text = $where
+        $W.CardEngineTitle.Text = 'Ready'
+        $W.CardEngineSub.Text = $(if ($s.Offline) { 'cached engine' } else { "resume.io $($s.Engine)" })
+        if ($UI.PendingRender) { $UI.PendingRender = $false; Request-Render }
+        elseif (-not $UI.Json) { Set-Status 'Ready. Start with step 1 - or drop a resume .json on this window.' 'ok' }
+        return
     }
+    $W.CreateBtn.IsEnabled = $true; $W.DetectedCreateBtn.IsEnabled = $true
+    if ($s.Error) {
+        $UI.RenderedHash = ''
+        Set-Status $s.Error 'error'
+        return
+    }
+    $r = $s.Result
+    $UI.Saved += @($r.Files | Where-Object { $_ -like '*.png' }).Count
+    $W.SavedCount.Text = [string]$UI.Saved
+    $UI.LastPng = $r.Primary; $UI.LastFiles = $r.Files
+    Show-Preview $r.Preview $r
+    Set-Status ("Saved {0}  ({1} page(s) in {2}s)" -f [IO.Path]::GetFileName($r.Primary), $r.Pages, $r.Seconds) 'ok'
+    if ($W.OpenAfterChk.IsChecked) { Invoke-Item -LiteralPath $r.Primary }
 }
 
-function Get-RGResumeList($Obj) {
-    $arr = $null
-    if ($Obj -is [array]) { $arr = $Obj }
-    else {
-        foreach ($p in $Obj.PSObject.Properties) { if ($p.Value -is [array] -and $p.Value.Count -gt 0) { $arr = $p.Value; break } }
-    }
-    if (-not $arr) { return @() }
-    return @($arr | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] -and $_.PSObject.Properties['id'] })
+# ======================================================================= wiring
+$W.VersionText.Text = "v$($script:RG_VERSION)"
+$W.AboutText.Text = "ResumeGrabber $($script:RG_VERSION)  -  temporary session folder: $SessionDir`nRenders with resume.io's own engine. Inspired by felipeall/resumeio-to-pdf (MIT)."
+$W.Busy.Visibility = 'Collapsed'
+Update-Cards
+
+$W.MinBtn.Add_Click({ $window.WindowState = 'Minimized' })
+$W.MaxBtn.Add_Click({ if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' } else { $window.WindowState = 'Maximized' } })
+$W.CloseBtn.Add_Click({ $window.Close() })
+$window.Add_StateChanged({
+    if ($window.WindowState -eq 'Maximized') { $window.Content.Margin = '7'; $W.MaxBtn.Content = [string][char]0xE923 }
+    else { $window.Content.Margin = '0'; $W.MaxBtn.Content = [string][char]0xE922 }
+})
+
+$pages = @{ NavGrab = 'PageGrab'; NavPreview = 'PagePreview'; NavSettings = 'PageSettings' }
+foreach ($nav in $pages.Keys) {
+    $W[$nav].Add_Checked({
+        param($s, $e)
+        foreach ($k in $pages.Keys) { $W[$pages[$k]].Visibility = $(if ($W[$k] -eq $s) { 'Visible' } else { 'Collapsed' }) }
+    })
 }
 
-# ================================================================= screens
-function Invoke-QuickGrab {
-    Show-RGBanner
-    Write-C '   QUICK GRAB  -  3 steps, no files to save' 'Cyan'
-    Write-RGRule
-    Write-Info 'Make sure you are logged in to resume.io in your browser.'
-    Write-Info 'Chrome / Edge: just press Ctrl+A then Ctrl+C on each page that opens.'
-    Write-Info 'Firefox: click "Raw Data" first, then Ctrl+A, Ctrl+C.'
-    Write-Host ''
+$W.OpenListBtn.Add_Click({
+    Start-Process 'https://resume.io/api/app/resumes'
+    $W.Step1Text.Text = 'Opened in your browser. Press Ctrl+A, then Ctrl+C on that page.'
+    Set-Status 'Waiting for you to copy the resume list (Ctrl+A, Ctrl+C)...' 'busy'
+})
 
-    Write-C '   STEP 1/3 ' 'Magenta' -NoNewline; Write-C '  Opening your resume list...' 'White'
-    Open-RGUrl "$($script:RG_ORIGIN)/api/app/resumes"
-    $listJson = Wait-RGClipboardJson -Waiting '   Copy the page (Ctrl+A, Ctrl+C)' -Accept {
-        param($o) (Get-RGResumeList $o).Count -gt 0 -or (Test-RGResumeDoc $o)
+$W.OpenFileBtn.Add_Click({
+    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg.Filter = 'Resume JSON (*.json;*.txt)|*.json;*.txt|All files (*.*)|*.*'
+    $dlg.InitialDirectory = $UI.OutDir
+    if ($dlg.ShowDialog($window)) {
+        try { Receive-JsonText ([IO.File]::ReadAllText($dlg.FileName)) 'file' -UserAction } catch { Set-Status $_.Exception.Message 'error' }
     }
-    if (-not $listJson) { return }
-    $listObj = ConvertFrom-RGJson $listJson
+})
 
-    # They may have copied a single resume directly - just render it.
-    if (Test-RGResumeDoc $listObj) {
-        Write-Ok 'Got a full resume - rendering it.'
-        $null = Convert-RGJson -JsonText $listJson -Label 'clipboard'
-        Wait-RGKey; return
+$W.PasteBtn.Add_Click({
+    $t = Get-ClipText
+    $UI.LastClip = $t
+    if (-not $t) { Set-Status 'Your clipboard is empty. Copy the resume page first.' 'warn'; return }
+    try { Receive-JsonText $t 'clipboard' -UserAction } catch { Set-Status $_.Exception.Message 'error' }
+})
+
+$W.CreateBtn.Add_Click({ Request-Render })
+$W.DetectedCreateBtn.Add_Click({ Request-Render })
+$W.OpenOutBtn.Add_Click({ if (-not (Test-Path -LiteralPath $UI.OutDir)) { New-Item -ItemType Directory -Path $UI.OutDir -Force | Out-Null }; Invoke-Item -LiteralPath $UI.OutDir })
+
+$W.BrowseBtn.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Where should your PNGs be saved?'
+    $dlg.SelectedPath = $UI.OutDir
+    if ($dlg.ShowDialog() -eq 'OK') { $UI.OutDir = $dlg.SelectedPath; Update-Cards }
+})
+foreach ($n in 'Q150', 'Q220', 'Q300', 'LayoutOne', 'LayoutPages', 'LayoutBoth') { $W[$n].Add_Checked({ Update-Cards }) }
+$W.AlsoPdfChk.Add_Click({ Update-Cards })
+
+$W.OpenPngBtn.Add_Click({ if ($UI.LastPng -and (Test-Path -LiteralPath $UI.LastPng)) { Invoke-Item -LiteralPath $UI.LastPng } })
+$W.ShowFolderBtn.Add_Click({ if ($UI.LastPng) { Start-Process explorer.exe -ArgumentList "/select,`"$($UI.LastPng)`"" } })
+$W.CopyImgBtn.Add_Click({
+    if ($W.PreviewImage.Source) { [Windows.Clipboard]::SetImage($W.PreviewImage.Source); Set-Status 'Image copied - paste it anywhere.' 'ok' }
+})
+$W.SaveAsBtn.Add_Click({
+    if (-not $UI.LastPng) { return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'PNG image (*.png)|*.png'
+    $dlg.FileName = [IO.Path]::GetFileName($UI.LastPng)
+    if ($dlg.ShowDialog($window)) { Copy-Item -LiteralPath $UI.LastPng -Destination $dlg.FileName -Force; Set-Status "Saved a copy to $($dlg.FileName)" 'ok' }
+})
+
+# drag & drop
+$window.Add_DragEnter({ param($s, $e) if ($e.Data.GetDataPresent([Windows.DataFormats]::FileDrop)) { $W.DropOverlay.Visibility = 'Visible' } })
+$window.Add_DragLeave({ $W.DropOverlay.Visibility = 'Collapsed' })
+$window.Add_Drop({
+    param($s, $e)
+    $W.DropOverlay.Visibility = 'Collapsed'
+    $files = $e.Data.GetData([Windows.DataFormats]::FileDrop)
+    if ($files) {
+        $f = @($files)[0]
+        try { Receive-JsonText ([IO.File]::ReadAllText($f)) 'file' -UserAction } catch { Set-Status $_.Exception.Message 'error' }
     }
+})
 
-    $list = Get-RGResumeList $listObj
-    Write-Ok ("Found {0} resume(s)." -f $list.Count)
-    $chosen = $list[0]
-    if ($list.Count -gt 1) {
-        $items = @(); $n = 0
-        foreach ($r in ($list | Select-Object -First 9)) {
-            $n++
-            $label = @($r.PSObject.Properties['name'], $r.PSObject.Properties['title']) | Where-Object { $_ -and $_.Value } | Select-Object -First 1
-            $label = if ($label) { [string]$label.Value } else { "Resume $($r.id)" }
-            $hint = ''
-            foreach ($k in 'updatedAt', 'updated_at') { if ($r.PSObject.Properties[$k]) { $hint = 'updated ' + ([string]$r.$k).Substring(0, [Math]::Min(10, ([string]$r.$k).Length)) } }
-            $items += @{ Key = [string]$n; Label = $label; Hint = $hint; Obj = $r }
-        }
-        Write-Host ''
-        $pick = Show-RGMenu -Title 'Which resume?' -Items $items
-        $hit = $items | Where-Object { $_.Key -eq $pick } | Select-Object -First 1
-        if (-not $hit) { return }
-        $chosen = $hit.Obj
+# timers: job polling + clipboard watching
+$jobTimer = New-Object Windows.Threading.DispatcherTimer
+$jobTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+$jobTimer.Add_Tick({
+    if (-not $script:Job) { return }
+    $s = $script:Job.Sync
+    if ($script:Job.Kind -eq 'prepare') {
+        if ($s.Phase -eq 'node') { $W.CardNodeTitle.Text = 'Setting up...' }
+        if ($s.Phase -eq 'engine') { $W.CardNodeTitle.Text = "Node.js $($s.NodeVer)"; $W.CardEngineTitle.Text = 'Downloading...' }
     }
-    $id = [string]$chosen.id
+    if ($s.Status -and $W.StatusText.Text -ne $s.Status -and ($script:Job.Kind -eq 'render' -or -not $UI.Json)) { Set-Status ($s.Status + '...') 'busy' }
+    if ($s.Done) { Complete-Job }
+})
 
-    Write-Host ''
-    Write-C '   STEP 2/3 ' 'Magenta' -NoNewline; Write-C "  Opening resume $id..." 'White'
-    Open-RGUrl "$($script:RG_ORIGIN)/api/app/resumes/$id"
-    $docJson = Wait-RGClipboardJson -Waiting '   Copy this page too (Ctrl+A, Ctrl+C)' -Accept {
-        param($o) (Test-RGResumeDoc $o)
+$clipTimer = New-Object Windows.Threading.DispatcherTimer
+$clipTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$clipTimer.Add_Tick({
+    $UI.Tick++
+    if ($UI.Tick % 5 -eq 0) {
+        try {
+            $bytes = (Get-ChildItem -LiteralPath $SessionDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+            $W.TempSize.Text = '{0:N0} MB' -f ($bytes / 1MB)
+        } catch { }
     }
-    if (-not $docJson) { return }
+    $t = Get-ClipText
+    if (-not $t -or $t -eq $UI.LastClip) { return }
+    $UI.LastClip = $t
+    if ($t.Length -gt 5MB -or $t.IndexOf('"id"') -lt 0) { return }
+    try { Receive-JsonText $t 'clipboard' } catch { }
+})
 
-    Write-Host ''
-    Write-C '   STEP 3/3 ' 'Magenta' -NoNewline; Write-C '  Building your PDF' 'White'
-    $null = Convert-RGJson -JsonText $docJson -Label "resume $id"
-    Wait-RGKey
-}
+$window.Add_Loaded({
+    $UI.LastClip = Get-ClipText   # ignore whatever was on the clipboard before the app opened
+    Set-Status 'Getting ready - downloading the renderer into a temporary folder...' 'busy'
+    Start-RGJob 'prepare'
+    $jobTimer.Start(); $clipTimer.Start()
+    $window.Activate()
+})
 
-function Invoke-ConvertFiles {
-    Show-RGBanner
-    Write-C '   CONVERT JSON FILE(S)' 'Cyan'; Write-RGRule
-    $files = Select-RGFile -InitialDir (Get-DownloadsDir)
-    if (-not $files -or $files.Count -eq 0) { Write-Warn 'Nothing selected.'; Wait-RGKey; return }
-    $ok = 0
-    foreach ($f in $files) {
-        if (-not (Test-Path -LiteralPath $f)) { Write-Err "Not found: $f"; continue }
-        Write-Host ''
-        if (Convert-RGFile $f -NoOpen:($files.Count -gt 1)) { $ok++ }
-    }
-    Write-Host ''; Write-Ok "$ok of $($files.Count) converted."
-    Wait-RGKey
-}
+$window.Add_Closing({
+    $jobTimer.Stop(); $clipTimer.Stop()
+    if ($script:Job) { try { $script:Job.PS.Stop() } catch { } }
+    Get-Process node -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$SessionDir*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+})
 
-function Invoke-ConvertClipboard {
-    Show-RGBanner
-    Write-C '   CONVERT FROM CLIPBOARD' 'Cyan'; Write-RGRule
-    $json = Get-JsonFromText (Get-RGClipboardText)
-    if ($json -and (Test-RGResumeDoc (ConvertFrom-RGJson $json))) {
-        $null = Convert-RGJson -JsonText $json -Label 'clipboard'
-    } else {
-        Write-Info 'Your clipboard has no resume JSON yet. Copy https://resume.io/api/app/resumes/<id>'
-        $json = Wait-RGClipboardJson -Accept { param($o) Test-RGResumeDoc $o }
-        if ($json) { $null = Convert-RGJson -JsonText $json -Label 'clipboard' }
-    }
-    Wait-RGKey
-}
+[void]$window.ShowDialog()
 
-function Invoke-Batch {
-    Show-RGBanner
-    Write-C '   BATCH CONVERT A FOLDER' 'Cyan'; Write-RGRule
-    $dir = Select-RGFolder 'Folder with resume.io JSON files' (Get-DownloadsDir)
-    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { Write-Warn 'No folder chosen.'; Wait-RGKey; return }
-    $files = @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -Recurse -ErrorAction SilentlyContinue)
-    $cands = @()
-    foreach ($f in $files) {
-        try { $j = Get-JsonFromText ([IO.File]::ReadAllText($f.FullName)); if ($j -and (Test-RGResumeDoc (ConvertFrom-RGJson $j))) { $cands += $f } } catch { }
-    }
-    if ($cands.Count -eq 0) { Write-Warn "No resume.io JSON files in $dir"; Wait-RGKey; return }
-    Write-Ok "$($cands.Count) resume(s) found."
-    $ok = 0; $n = 0
-    foreach ($f in $cands) {
-        $n++; Write-Host ''; Write-C ("   ({0}/{1}) {2}" -f $n, $cands.Count, $f.Name) 'White'
-        if (Convert-RGFile $f.FullName -NoOpen) { $ok++ }
-    }
-    Write-Host ''; Write-Ok "$ok of $($cands.Count) converted into $((Get-RGSettings).OutputDir)"
-    if ($ok -gt 0 -and (Read-RGYesNo 'Open the output folder?')) { Open-RGItem (Get-RGSettings).OutputDir }
-    Wait-RGKey
-}
-
-function Invoke-WatchMode {
-    param([switch]$Standalone)
-    $settings = Get-RGSettings
-    $folder = $settings.WatchFolder
-    if (-not $Standalone) { Show-RGBanner }
-    Write-C '   WATCH MODE' 'Cyan'; Write-RGRule
-    Write-Info "Watching: $folder  (new .json files)"
-    Write-Info 'Watching: your clipboard (copied resume JSON)'
-    Write-Info 'Any resume.io JSON that shows up is converted automatically. Press Q or Esc to stop.'
-    Write-Host ''
-    $seen = @{}
-    if (Test-Path -LiteralPath $folder) {
-        Get-ChildItem -LiteralPath $folder -Filter *.json -File -ErrorAction SilentlyContinue | ForEach-Object { $seen[$_.FullName] = $_.LastWriteTimeUtc }
-    }
-    $lastClip = Get-RGClipboardText
-    $count = 0
-    while ($true) {
-        if ($script:RG_Interactive -and [Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true)
-            if ($k.Key -eq 'Escape' -or $k.KeyChar -eq 'q' -or $k.KeyChar -eq 'Q') { break }
-        }
-        if (Test-Path -LiteralPath $folder) {
-            foreach ($f in (Get-ChildItem -LiteralPath $folder -Filter *.json -File -ErrorAction SilentlyContinue)) {
-                if ($seen.ContainsKey($f.FullName) -and $seen[$f.FullName] -eq $f.LastWriteTimeUtc) { continue }
-                $seen[$f.FullName] = $f.LastWriteTimeUtc
-                Start-Sleep -Milliseconds 600   # let the browser finish writing
-                try {
-                    $j = Get-JsonFromText ([IO.File]::ReadAllText($f.FullName))
-                    if ($j -and (Test-RGResumeDoc (ConvertFrom-RGJson $j))) {
-                        Write-Host ("`r" + (' ' * 60) + "`r") -NoNewline
-                        Write-C ("   [{0:HH:mm:ss}] new file: {1}" -f (Get-Date), $f.Name) 'White'
-                        if (Convert-RGJson -JsonText $j -Label $f.Name) {
-                            $count++
-                            if ($settings.DeleteJsonAfter) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
-                        }
-                        Write-Host ''
-                    }
-                } catch { }
-            }
-        }
-        $clip = Get-RGClipboardText
-        if ($clip -and $clip -ne $lastClip) {
-            $lastClip = $clip
-            $j = Get-JsonFromText $clip
-            if ($j) {
-                try {
-                    if (Test-RGResumeDoc (ConvertFrom-RGJson $j)) {
-                        Write-Host ("`r" + (' ' * 60) + "`r") -NoNewline
-                        Write-C ("   [{0:HH:mm:ss}] resume copied to clipboard" -f (Get-Date)) 'White'
-                        if (Convert-RGJson -JsonText $j -Label 'clipboard') { $count++ }
-                        Write-Host ''
-                    }
-                } catch { }
-            }
-        }
-        if ($script:RG_Interactive) { Write-Host ("`r   watching... {0} converted so far  " -f $count) -ForegroundColor DarkMagenta -NoNewline }
-        Start-Sleep -Milliseconds 800
-    }
-    Write-Host ''
-    Write-Ok "Watch mode stopped. $count resume(s) converted."
-    if (-not $Standalone) { Wait-RGKey }
-}
-
-function Invoke-History {
-    Show-RGBanner
-    Write-C '   RECENT PDFs' 'Cyan'; Write-RGRule
-    $h = @(Get-RGHistory | Select-Object -First 9)
-    if ($h.Count -eq 0) { Write-Info 'Nothing yet - convert your first resume!'; Wait-RGKey; return }
-    $items = @(); $n = 0
-    foreach ($e in $h) {
-        $n++
-        $exists = Test-Path -LiteralPath $e.output
-        $label = [IO.Path]::GetFileName([string]$e.output)
-        if ($label.Length -gt 34) { $label = $label.Substring(0, 33) + '~' }
-        $hint = "{0}  {1}p{2}" -f $e.time, $e.pages, $(if ($exists) { '' } else { '  (moved)' })
-        $items += @{ Key = [string]$n; Label = $label; Hint = $hint; Path = [string]$e.output }
-    }
-    $items += @{ Key = 'B'; Label = 'Back'; Hint = '' }
-    $pick = Show-RGMenu -Title 'Open which PDF?' -Items $items
-    $hit = $items | Where-Object { $_.Key -eq $pick -and $_.Path } | Select-Object -First 1
-    if ($hit) {
-        if (Test-Path -LiteralPath $hit.Path) { Show-RGInExplorer $hit.Path; Open-RGItem $hit.Path } else { Write-Warn 'That file was moved or deleted.'; Wait-RGKey }
-    }
-}
-
-function Invoke-Settings {
-    while ($true) {
-        $s = Get-RGSettings
-        Show-RGBanner
-        Write-C '   SETTINGS' 'Cyan'; Write-RGRule
-        $loc = if ($s.Locale) { $s.Locale } else { 'auto (from resume)' }
-        $items = @(
-            @{ Key = '1'; Label = 'Output folder';        Hint = [string]$s.OutputDir },
-            @{ Key = '2'; Label = 'Open PDF after render'; Hint = $(if ($s.OpenAfterRender) { 'ON' } else { 'OFF' }) },
-            @{ Key = '3'; Label = 'File name template';   Hint = [string]$s.FileNameTemplate },
-            @{ Key = '4'; Label = 'Language override';    Hint = $loc },
-            @{ Key = '5'; Label = 'Watch folder';         Hint = [string]$s.WatchFolder },
-            @{ Key = '6'; Label = 'Delete JSON after watch'; Hint = $(if ($s.DeleteJsonAfter) { 'ON' } else { 'OFF' }) },
-            @{ Key = 'R'; Label = 'Reset to defaults';    Hint = '' },
-            @{ Key = 'B'; Label = 'Back';                 Hint = '' }
-        )
-        $pick = Show-RGMenu -Title 'Change what?' -Items $items
-        Write-Host ''
-        switch ($pick) {
-            '1' { $d = Select-RGFolder 'Where should PDFs go?' $s.OutputDir; if ($d) { $s.OutputDir = $d } }
-            '2' { $s.OpenAfterRender = -not $s.OpenAfterRender }
-            '3' {
-                Write-Info 'Placeholders: {name} {title} {doc} {date} {id} {token} {template}'
-                $s.FileNameTemplate = Read-RGText 'New template' $s.FileNameTemplate
-            }
-            '4' { $s.Locale = Read-RGText 'Language code like en, de, fr, es, pt (blank = auto)' ''; }
-            '5' { $d = Select-RGFolder 'Folder to watch' $s.WatchFolder; if ($d) { $s.WatchFolder = $d } }
-            '6' { $s.DeleteJsonAfter = -not $s.DeleteJsonAfter }
-            'R' { Remove-Item -LiteralPath (Get-RGPath 'settings') -Force -ErrorAction SilentlyContinue; continue }
-            default { return }
-        }
-        Save-RGSettings $s
-    }
-}
-
-function Invoke-Doctor {
-    param([switch]$Standalone)
-    if (-not $Standalone) { Show-RGBanner }
-    Write-C '   DOCTOR' 'Cyan'; Write-RGRule
-    $bad = 0
-    Write-Ok ("ResumeGrabber {0}  |  PowerShell {1}  |  {2}" -f $script:RG_VERSION, $PSVersionTable.PSVersion, [Environment]::OSVersion.VersionString)
-    Write-Info ("Home: {0}" -f (Get-RGHome))
-
-    $node = Find-RGNode
-    if ($node) { Write-Ok ("Node.js {0}  ({1})" -f (& $node --version), $node) }
-    else { Write-Warn 'Node.js not installed yet - it will be downloaded automatically (portable, ~30 MB) on first render.' }
-
-    $wdir = Get-RGPath 'worker'
-    $files = @(Get-ChildItem -LiteralPath $wdir -File -ErrorAction SilentlyContinue)
-    if ($files.Count) { Write-Ok ("Engine cache: {0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB)) }
-    else { Write-Info 'Engine cache: empty (downloads on first render)' }
-
-    foreach ($u in @("$($script:RG_ORIGIN)/app/resumes", 'https://nodejs.org/dist/index.json', 'https://github.com')) {
-        try { $null = Invoke-RGGet $u -Retries 1; Write-Ok "Reachable: $u" } catch { $bad++; Write-Err "Unreachable: $u" }
-    }
-    try {
-        $b = Get-RGBundle -OnStatus { param($m) Write-Step $m }
-        Write-Ok "resume.io engine: $($b.Entry)"
-    } catch { $bad++; Write-Err $_.Exception.Message }
-
-    $out = (Get-RGSettings).OutputDir
-    try {
-        if (-not (Test-Path -LiteralPath $out)) { New-Item -ItemType Directory -Path $out -Force | Out-Null }
-        $t = Join-Path $out '.rg-write-test'; Set-Content -LiteralPath $t -Value 'ok'; Remove-Item -LiteralPath $t -Force
-        Write-Ok "Output folder writable: $out"
-    } catch { $bad++; Write-Err "Can't write to $out" }
-
-    Write-Host ''
-    if ($bad -eq 0) { Write-Ok 'Everything looks good.' } else { Write-Warn "$bad problem(s) found. Log: $(Get-RGPath 'log')" }
-    if (-not $Standalone) { Wait-RGKey }
-}
-
-function Invoke-RefreshEngine {
-    Write-Step 'Clearing cached engine'
-    Get-ChildItem -LiteralPath (Get-RGPath 'worker') -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path (Get-RGPath 'cache') 'discovery.json') -Force -ErrorAction SilentlyContinue
-    try { $b = Get-RGBundle -Force -OnStatus { param($m) Write-Step $m }; Write-Ok "Engine ready: $($b.Entry)" } catch { Write-Err $_.Exception.Message }
-}
-
-function Invoke-SelfUpdate {
-    Write-Step "Downloading the latest ResumeGrabber from github.com/$($script:RG_REPO)"
-    try {
-        $installer = Invoke-RGGet "https://raw.githubusercontent.com/$($script:RG_REPO)/main/install.ps1"
-        $tmp = Join-Path (Get-RGPath 'tmp') 'install.ps1'
-        Write-Utf8NoBom $tmp $installer
-        $exe = (Get-Process -Id $PID).Path
-        & $exe -NoProfile -ExecutionPolicy Bypass -File $tmp -Quiet
-        Write-Ok 'Updated. Restart ResumeGrabber to use the new version.'
-    } catch { Write-Err "Update failed: $($_.Exception.Message)" }
-}
-
-function Show-RGHelp {
-    Show-RGBanner
-    Write-C '   HOW IT WORKS' 'Cyan'; Write-RGRule
-    Write-Info '1. resume.io keeps your resume as JSON at  https://resume.io/api/app/resumes/<id>'
-    Write-Info '2. ResumeGrabber feeds that JSON to resume.io''s own rendering engine,'
-    Write-Info '   running locally inside a sandboxed, portable Node.js.'
-    Write-Info '3. You get the exact same layout as the editor: every page, vector text, photo.'
-    Write-Host ''
-    Write-C '   COMMAND LINE' 'Cyan'; Write-RGRule
-    Write-Info 'resumegrabber                       interactive app'
-    Write-Info 'resumegrabber resume.json           convert one file'
-    Write-Info 'resumegrabber a.json b.json -Out C:\CVs'
-    Write-Info 'resumegrabber -Clipboard -Open      convert what you just copied'
-    Write-Info 'resumegrabber -Watch                auto-convert downloads + clipboard'
-    Write-Info 'resumegrabber -Doctor | -Update | -RefreshEngine | -Version'
-    Write-Host ''
-    Write-Info 'Tip: right-click any .json in Explorer -> "Convert with ResumeGrabber"'
-    Write-Info '(Windows 11: Show more options). Your data only ever goes to resume.io.'
-    Wait-RGKey
-}
-
-# ================================================================= entry
-Set-RGConsole
-
-if ($Version) { Write-Output "ResumeGrabber $($script:RG_VERSION)"; exit 0 }
-if ($Doctor) { Invoke-Doctor -Standalone; exit 0 }
-if ($Update) { Invoke-SelfUpdate; exit 0 }
-if ($RefreshEngine) { Invoke-RefreshEngine; exit 0 }
-if ($Watch) { Invoke-WatchMode -Standalone; exit 0 }
-
-if ($Clipboard) {
-    $json = Get-JsonFromText (Get-RGClipboardText)
-    if (-not $json) { Write-Err 'Clipboard does not contain resume JSON.'; exit 1 }
-    $r = Convert-RGJson -JsonText $json -Label 'clipboard' -OutPath $Out -OpenAfter:$Open -NoOpen:(-not $Open)
-    if ($r) { exit 0 } else { exit 1 }
-}
-
-if ($Path -and $Path.Count -gt 0) {
-    $targets = @()
-    foreach ($p in $Path) {
-        $resolved = @(Resolve-Path -Path $p -ErrorAction SilentlyContinue)
-        if (-not $resolved) { Write-Err "Not found: $p"; continue }
-        foreach ($r in $resolved) {
-            if (Test-Path -LiteralPath $r.Path -PathType Container) {
-                $targets += @(Get-ChildItem -LiteralPath $r.Path -Filter *.json -File | ForEach-Object FullName)
-            } else { $targets += $r.Path }
-        }
-    }
-    $fail = 0
-    $outArg = $Out
-    if ($targets.Count -gt 1 -and $Out -match '\.pdf$') { $outArg = Split-Path -Parent $Out }
-    foreach ($t in $targets) {
-        if (-not (Convert-RGFile $t -OutPath $outArg -OpenAfter:$Open -NoOpen:(-not $Open))) { $fail++ }
-    }
-    # Launched from Explorer's right-click menu: keep the window open so the result is readable.
-    if ($env:RG_FROM_EXPLORER -eq '1') {
-        if ($fail -eq 0 -and $targets.Count -gt 0) { Start-Sleep -Seconds 3 } else { Wait-RGKey 'Press any key to close' }
-    }
-    if ($fail -gt 0) { exit 1 } else { exit 0 }
-}
-
-# ---- interactive app
-while ($true) {
-    Show-RGBanner
-    $s = Get-RGSettings
-    $last = @(Get-RGHistory | Select-Object -First 1)
-    if ($last.Count) { Write-Info ("Last PDF: {0}  ({1})" -f [IO.Path]::GetFileName([string]$last[0].output), $last[0].time); Write-Host '' }
-    $choice = Show-RGMenu -Title 'What do you want to do?' -Items @(
-        @{ Key = '1'; Label = 'Quick Grab (guided)';        Hint = 'easiest - browser + clipboard' },
-        @{ Key = '2'; Label = 'Convert JSON file(s)';        Hint = 'pick one or many files' },
-        @{ Key = '3'; Label = 'Convert from clipboard';      Hint = 'you already copied the JSON' },
-        @{ Key = '4'; Label = 'Batch convert a folder';      Hint = 'every resume JSON inside' },
-        @{ Key = '5'; Label = 'Watch mode';                  Hint = 'auto-convert as you download' },
-        @{ Key = '6'; Label = 'Recent PDFs';                 Hint = 'reopen past conversions' },
-        @{ Key = '7'; Label = 'Open output folder';          Hint = [string]$s.OutputDir },
-        @{ Key = '8'; Label = 'Settings';                    Hint = 'folder, naming, language' },
-        @{ Key = '9'; Label = 'Doctor';                      Hint = 'check everything works' },
-        @{ Key = 'U'; Label = 'Update ResumeGrabber';        Hint = 'app + rendering engine' },
-        @{ Key = 'H'; Label = 'Help';                        Hint = 'how it works, CLI usage' },
-        @{ Key = 'Q'; Label = 'Quit';                        Hint = '' }
-    )
-    switch ($choice) {
-        '1' { Invoke-QuickGrab }
-        '2' { Invoke-ConvertFiles }
-        '3' { Invoke-ConvertClipboard }
-        '4' { Invoke-Batch }
-        '5' { Invoke-WatchMode }
-        '6' { Invoke-History }
-        '7' { $d = $s.OutputDir; if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }; Open-RGItem $d }
-        '8' { Invoke-Settings }
-        '9' { Invoke-Doctor }
-        'U' { Show-RGBanner; Invoke-SelfUpdate; Invoke-RefreshEngine; Wait-RGKey }
-        'H' { Show-RGHelp }
-        default { Write-Host ''; Write-C '   Bye!' 'Cyan'; exit 0 }
-    }
+# ======================================================================= leave no trace
+if ($script:Job) { try { $script:Job.PS.Dispose(); $script:Job.RS.Dispose() } catch { } }
+Set-Location -LiteralPath $env:TEMP
+$cleanTarget = $env:RESUMEGRABBER_HOME
+if ($OwnsSession -or ($Root -like "$SessionDir*")) { $cleanTarget = $SessionDir }
+for ($i = 0; $i -lt 10 -and (Test-Path -LiteralPath $cleanTarget); $i++) {
+    Remove-Item -LiteralPath $cleanTarget -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $cleanTarget) { Start-Sleep -Milliseconds 500 }
 }

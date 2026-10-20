@@ -1,110 +1,65 @@
 # ResumeGrabber
 
-**Turn your [resume.io](https://resume.io) resume into a pixel-perfect, multi-page, vector PDF — from a slick PowerShell app.**
-No Docker. No Python. No admin rights. One line to install.
+**Your resume.io resume → a crisp PNG, in a clean Windows app that leaves nothing behind.**
 
-```
-  ____                                ____           _     _
- |  _ \ ___  ___ _   _ _ __ ___   ___/ ___|_ __ __ _| |__ | |__   ___ _ __
- | |_) / _ \/ __| | | | '_ ` _ \ / _ \ |  _| '__/ _` | '_ \| '_ \ / _ \ '__|
- |  _ <  __/\__ \ |_| | | | | | |  __/ |_| | | | (_| | |_) | |_) |  __/ |
- |_| \_\___||___/\__,_|_| |_| |_|\___|\____|_|  \__,_|_.__/|_.__/ \___|_|
-```
+- **Portable.** Nothing is installed: no Docker, no Python, no admin rights, no shortcuts, no registry entries.
+- **Leaves no trace.** The app runs from a temporary folder that is deleted the moment you close the window. Only your PNG stays.
+- **Exact layout.** Uses resume.io's own renderer, so the PNG looks exactly like the editor — every page, your photo, the right fonts.
 
-## Install (Windows 10/11)
+## Run it (Windows 10/11)
 
 Open **PowerShell** and paste:
 
 ```powershell
-irm https://raw.githubusercontent.com/Sacttt/ResumeGrabber/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Sacttt/ResumeGrabber/main/run.ps1 | iex
 ```
 
-That's it. You get:
+The app window opens. When you close it, the temporary folder is wiped and PowerShell prints
+`Cleaned up. Nothing was left on your PC except your PNGs.`
 
-- a **ResumeGrabber** shortcut on your Desktop and Start Menu
-- a `resumegrabber` command in every new terminal
-- **Right-click any `.json` → Convert with ResumeGrabber** in Explorer
-- a portable Node.js (checksum-verified, kept inside `%LOCALAPPDATA%\ResumeGrabber`) — nothing is installed system-wide
+## Get your PNG in 3 copies
 
-## Use it
+1. Click **Open resume.io** (be signed in). On that page press **Ctrl+A**, then **Ctrl+C**.
+2. Your resumes appear as cards in the app. Click the one you want — it opens in your browser.
+3. Press **Ctrl+A**, **Ctrl+C** again. The PNG is created right away and saved to **Downloads** as
+   `Your Name - Job Title - Resume.png`.
 
-Launch **ResumeGrabber** and pick **Quick Grab**:
+ResumeGrabber watches your clipboard while it is open, so there's nothing to paste. Firefox users: click **Raw Data**
+before copying. Have the resume JSON as a file already? Click **Open file** or just drop it on the window.
 
-1. It opens your resume list on resume.io (be logged in). Press **Ctrl+A, Ctrl+C**.
-2. Pick the resume from the menu. It opens that resume's page — **Ctrl+A, Ctrl+C** again.
-3. Your PDF appears in `Documents\ResumeGrabber`, named like `Jane Doe - Product Designer - Resume.pdf`.
-
-No saving files, no hunting for IDs. (Firefox: click **Raw Data** before copying.)
-
-### Everything in the app
+## Features
 
 | | |
 |---|---|
-| **Quick Grab** | Guided browser + clipboard flow, 3 steps |
-| **Convert JSON file(s)** | File picker, multi-select |
-| **Convert from clipboard** | Already copied the JSON? One key. |
-| **Batch convert** | Every resume JSON in a folder |
-| **Watch mode** | Auto-converts any resume JSON you download or copy |
-| **Recent PDFs** | Reopen anything you've made |
-| **Settings** | Output folder, file-name template (`{name} {title} {doc} {date} {id}`), language override, auto-open |
-| **Doctor** | Checks Node, engine cache, connectivity, permissions |
-| **Update** | Self-updates the app and refreshes resume.io's engine |
+| **Preview** | See the PNG in the app, then *Open*, *Show in folder*, *Save as…* or *Copy image* to paste anywhere |
+| **Quality** | Standard 150 DPI, High 220 DPI (default), Print 300 DPI |
+| **Multi-page** | One tall image, one PNG per page, or both |
+| **Also PDF** | Optionally keep a vector PDF next to the PNG |
+| **Language** | Override the resume's language for headings |
+| **Drag & drop** | Drop a `.json` anywhere on the window |
 
-### Command line
+Settings last for the session only — nothing is written to your PC.
 
-```powershell
-resumegrabber                              # interactive app
-resumegrabber resume.json                  # convert one file
-resumegrabber a.json b.json -Out C:\CVs    # many files into a folder
-resumegrabber .\folder                     # every JSON in a folder
-resumegrabber -Clipboard -Open             # convert what you just copied, open it
-resumegrabber -Watch                       # auto-convert downloads + clipboard
-resumegrabber resume.json -Locale de       # force a language
-resumegrabber -Doctor | -Update | -RefreshEngine | -Version
-```
+## What happens behind the scenes
 
-## How it works
+1. `run.ps1` downloads this repo into `%TEMP%\ResumeGrabber-xxxx` and opens the window.
+2. The app fetches a portable Node.js (checksum-verified; skipped if you already have Node 18+) and resume.io's
+   rendering worker into that same folder.
+3. Your resume JSON is rendered by resume.io's worker inside a locked-down Node.js sandbox that can only talk to
+   resume.io, giving a multi-page PDF.
+4. Windows' built-in PDF renderer turns each page into a PNG.
+5. On close, the whole `%TEMP%\ResumeGrabber-xxxx` folder is deleted. (If the PC is shut down mid-session, the next
+   launch sweeps the leftovers.)
 
-resume.io stores your resume as JSON (`https://resume.io/api/app/resumes/<id>`) and draws the PDF in your browser
-with a web worker. ResumeGrabber downloads that same worker (~4 MB, cached) and runs it in a locked-down Node.js
-`vm` sandbox that may only talk to `resume.io`. The output is identical to the editor: every page, selectable
-vector text, your photo.
-
-## Compared with the original
-
-Inspired by [felipeall/resumeio-to-pdf](https://github.com/felipeall/resumeio-to-pdf) (MIT).
-
-| | resumeio-to-pdf | **ResumeGrabber** |
-|---|---|---|
-| Runtime | Python + uv + Node (or Docker) | **Nothing** — portable Node auto-installed |
-| Install | `uv tool install …` | **one line**, shortcuts + PATH + right-click |
-| Getting the JSON | save the page by hand | **clipboard wizard**, watch mode |
-| Output name | `<renderingToken>.pdf` | `Name - Title - Resume.pdf`, templated |
-| Many resumes | one at a time | multi-select, folders, watch mode |
-| Offline re-render | — | cached engine + config, JSON backups |
-| Extras | web UI | history, settings, doctor, self-update |
-
-## Uninstall
-
-```powershell
-& "$env:LOCALAPPDATA\ResumeGrabber\app\uninstall.ps1"
-```
-
-Your PDFs in `Documents\ResumeGrabber` are left alone.
-
-## Privacy
-
-Your resume only ever goes to resume.io itself (to fetch fonts/images while rendering). Nothing else is contacted
-except nodejs.org (one-time Node download) and GitHub (updates).
-
-## Development
+## Develop
 
 ```powershell
 git clone https://github.com/Sacttt/ResumeGrabber; cd ResumeGrabber
-.\ResumeGrabber.ps1          # run from source
-.\tests\Run-Tests.ps1        # offline self-tests
-.\install.ps1                # install your local copy
+.\run.ps1                    # runs your local copy, portable like the real thing
+.\tests\Run-Tests.ps1        # self-tests (XAML, PDF->PNG, engine plumbing)
 ```
+
+Credit: the rendering approach comes from [felipeall/resumeio-to-pdf](https://github.com/felipeall/resumeio-to-pdf) (MIT).
 
 ## Disclaimer
 

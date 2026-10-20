@@ -1,9 +1,10 @@
 name: test
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 jobs:
   windows:
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         shell: [powershell, pwsh]
     steps:
@@ -24,3 +25,16 @@ jobs:
       - name: Self-tests
         shell: ${{ matrix.shell }}
         run: ./tests/Run-Tests.ps1
+      - name: Live check - fetch resume.io renderer
+        if: matrix.shell == 'powershell'
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $env:RESUMEGRABBER_HOME = Join-Path $env:RUNNER_TEMP 'rg'
+          . ./lib/Core.ps1
+          Initialize-RGDirs
+          $n = Get-RGNode -OnStatus { param($m) Write-Host $m }
+          Write-Host "node: $n $(& $n --version)"
+          $b = Get-RGBundle -OnStatus { param($m) Write-Host $m }
+          Write-Host "engine: $($b.Entry)"
+          Get-ChildItem $b.Dir | Format-Table Name, Length
