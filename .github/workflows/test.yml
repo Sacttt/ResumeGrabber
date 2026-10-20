@@ -25,7 +25,7 @@ jobs:
         run: |
           ./tests/Run-Tests.ps1 *>&1 | Tee-Object -FilePath out.txt
           $code = $LASTEXITCODE
-          Get-Content out.txt | Select-Object -Last 15 | ForEach-Object { Write-Host "::notice::$_" }
+          Get-Content out.txt | Where-Object { $_ -match "png|XAML|ERROR|FAIL|passed|PDF page|stacks" } | Select-Object -Last 9 | ForEach-Object { Write-Host "::notice::$_" }
           exit $code
       - name: Self-tests (PowerShell 7)
         shell: pwsh
