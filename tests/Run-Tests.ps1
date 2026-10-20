@@ -68,22 +68,7 @@ self.onmessage = (e) => {
         # --- PDF -> PNG with Windows' renderer (needs Windows PowerShell 5.1)
         if ($PSVersionTable.PSVersion.Major -le 5) {
             . (Join-Path (Join-Path $root 'lib') 'Png.ps1')
-            $objs = @(
-                '<< /Type /Catalog /Pages 2 0 R >>',
-                '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
-                '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>',
-                '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>'
-            )
-            $sb = New-Object Text.StringBuilder
-            [void]$sb.Append("%PDF-1.4`n")
-            $offsets = @()
-            for ($i = 0; $i -lt $objs.Count; $i++) { $offsets += $sb.Length; [void]$sb.Append("$($i + 1) 0 obj`n$($objs[$i])`nendobj`n") }
-            $xref = $sb.Length
-            [void]$sb.Append("xref`n0 $($objs.Count + 1)`n0000000000 65535 f `n")
-            foreach ($o in $offsets) { [void]$sb.Append(('{0:D10} 00000 n `n' -f $o)) }
-            [void]$sb.Append("trailer`n<< /Size $($objs.Count + 1) /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
-            $pdf = Join-Path $sandbox 'two.pdf'
-            [IO.File]::WriteAllText($pdf, $sb.ToString(), [Text.Encoding]::ASCII)
+            $pdf = Join-Path $PSScriptRoot 'fixture-2pages.pdf'
             $pngs = @(ConvertTo-RGPagePngs -PdfPath $pdf -OutDir (Join-Path $sandbox 'png') -Dpi 96)
             Assert ($pngs.Count -eq 2) 'renders each PDF page to PNG'
             $joined = Join-RGPngs -Pages $pngs -OutFile (Join-Path $sandbox 'all.png')
