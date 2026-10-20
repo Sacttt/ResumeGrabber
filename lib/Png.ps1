@@ -1,6 +1,8 @@
 # ResumeGrabber - PDF -> PNG using Windows' built-in PDF renderer (Windows.Data.Pdf, Windows 10+).
 # Needs Windows PowerShell 5.1 (WinRT interop). No extra software.
 
+$script:RG_WinRTReady = $false
+
 function Initialize-RGWinRT {
     if ($script:RG_WinRTReady) { return }
     Add-Type -AssemblyName System.Runtime.WindowsRuntime

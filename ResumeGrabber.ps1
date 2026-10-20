@@ -44,7 +44,7 @@ Initialize-RGDirs
 $xaml = [IO.File]::ReadAllText((Join-Path (Join-Path $Root 'ui') 'MainWindow.xaml'))
 $window = [Windows.Markup.XamlReader]::Parse($xaml)
 $W = @{}
-foreach ($m in [regex]::Matches($xaml, 'x:Name="([^"]+)"')) { $W[$m.Groups[1].Value] = $window.FindName($m.Groups[1].Value) }
+foreach ($m in [regex]::Matches([regex]::Replace($xaml, '(?s)<ControlTemplate.*?</ControlTemplate>', ''), 'x:Name="([^"]+)"')) { $W[$m.Groups[1].Value] = $window.FindName($m.Groups[1].Value) }
 
 $UI = @{
     Json = $null; Info = $null; JsonHash = ''; RenderedHash = ''

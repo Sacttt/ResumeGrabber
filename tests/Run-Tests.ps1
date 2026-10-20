@@ -60,8 +60,10 @@ self.onmessage = (e) => {
         Add-Type -AssemblyName PresentationFramework
         $xaml = [IO.File]::ReadAllText((Join-Path (Join-Path $root 'ui') 'MainWindow.xaml'))
         $win = [Windows.Markup.XamlReader]::Parse($xaml)
-        $names = [regex]::Matches($xaml, 'x:Name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
-        Assert ((@($names | Where-Object { -not $win.FindName($_) })).Count -eq 0) 'window XAML parses and every named element exists'
+        $outside = [regex]::Replace($xaml, '(?s)<ControlTemplate.*?</ControlTemplate>', '')
+        $names = [regex]::Matches($outside, 'x:Name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+        $missing = @($names | Where-Object { -not $win.FindName($_) })
+        Assert ($missing.Count -eq 0) ("window XAML parses and every named element exists " + ($missing -join ','))
 
         # --- PDF -> PNG with Windows' renderer (needs Windows PowerShell 5.1)
         if ($PSVersionTable.PSVersion.Major -le 5) {
