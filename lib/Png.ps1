@@ -18,13 +18,18 @@ function Initialize-RGWinRT {
 
 function Wait-RGOp($Operation, [type]$ResultType) {
     $task = $script:RG_AsTaskOp.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
-    [void]$task.Wait(-1)
+    try { [void]$task.Wait(-1) } catch { throw (Get-RGInnerError $_.Exception) }
     return $task.Result
+}
+
+function Get-RGInnerError($Ex) {
+    while ($Ex.InnerException) { $Ex = $Ex.InnerException }
+    return ("Windows PDF renderer: " + $Ex.Message)
 }
 
 function Wait-RGAction($Action) {
     $task = $script:RG_AsTaskAction.Invoke($null, @($Action))
-    [void]$task.Wait(-1)
+    try { [void]$task.Wait(-1) } catch { throw (Get-RGInnerError $_.Exception) }
 }
 
 function ConvertTo-RGPagePngs {
@@ -32,8 +37,11 @@ function ConvertTo-RGPagePngs {
     param([Parameter(Mandatory)][string]$PdfPath, [Parameter(Mandatory)][string]$OutDir, [int]$Dpi = 220, [scriptblock]$OnStatus = { param($m) })
     Initialize-RGWinRT
     if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
-    $file = Wait-RGOp ([Windows.Storage.StorageFile]::GetFileFromPathAsync([IO.Path]::GetFullPath($PdfPath))) ([Windows.Storage.StorageFile])
-    $doc = Wait-RGOp ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+    # Load through a plain .NET stream (no StorageFile brokering needed).
+    $pdfBytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($PdfPath))
+    $netStream = New-Object IO.MemoryStream (, $pdfBytes)
+    $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($netStream)
+    $doc = Wait-RGOp ([Windows.Data.Pdf.PdfDocument]::LoadFromStreamAsync($ras)) ([Windows.Data.Pdf.PdfDocument])
     $scale = $Dpi / 96.0
     $out = @()
     for ($i = 0; $i -lt $doc.PageCount; $i++) {
@@ -53,6 +61,7 @@ function ConvertTo-RGPagePngs {
             $out += $target
         } finally { $page.Dispose() }
     }
+    $ras.Dispose(); $netStream.Dispose()
     return $out
 }
 
