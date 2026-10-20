@@ -3,17 +3,13 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   windows:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Parse every script
-        shell: ${{ matrix.shell }}
+        shell: powershell
         run: |
           $bad = 0
           Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
@@ -22,11 +18,13 @@ jobs:
             if ($e) { $bad++; $e | ForEach-Object { Write-Host "$($_.Extent.File):$($_.Extent.StartLineNumber) $($_.Message)" } }
           }
           if ($bad) { exit 1 }
-      - name: Self-tests
-        shell: ${{ matrix.shell }}
+      - name: Self-tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Run-Tests.ps1
+      - name: Self-tests (PowerShell 7)
+        shell: pwsh
         run: ./tests/Run-Tests.ps1
       - name: Live check - fetch resume.io renderer
-        if: matrix.shell == 'powershell'
         continue-on-error: true
         shell: powershell
         run: |
