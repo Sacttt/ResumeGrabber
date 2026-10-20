@@ -2,6 +2,7 @@
 # Needs Windows PowerShell 5.1 (WinRT interop). No extra software.
 
 $script:RG_WinRTReady = $false
+function Write-RGTrace([string]$m) { if ($env:RG_TRACE) { [Console]::Out.WriteLine("[png] $m"); [Console]::Out.Flush() } }
 
 function Initialize-RGWinRT {
     if ($script:RG_WinRTReady) { return }
@@ -41,7 +42,9 @@ function ConvertTo-RGPagePngs {
     $pdfBytes = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($PdfPath))
     $netStream = New-Object IO.MemoryStream (, $pdfBytes)
     $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($netStream)
+    Write-RGTrace 'loading'
     $doc = Wait-RGOp ([Windows.Data.Pdf.PdfDocument]::LoadFromStreamAsync($ras)) ([Windows.Data.Pdf.PdfDocument])
+    Write-RGTrace "loaded $($doc.PageCount) pages"
     $scale = $Dpi / 96.0
     $out = @()
     for ($i = 0; $i -lt $doc.PageCount; $i++) {
@@ -52,13 +55,16 @@ function ConvertTo-RGPagePngs {
             $opts.DestinationWidth = [uint32][math]::Round($page.Size.Width * $scale)
             $opts.DestinationHeight = [uint32][math]::Round($page.Size.Height * $scale)
             $mem = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+            Write-RGTrace "render page $i $($opts.DestinationWidth)x$($opts.DestinationHeight)"
             Wait-RGAction ($page.RenderToStreamAsync($mem, $opts))
+            Write-RGTrace "rendered $($mem.Size) bytes"
             $mem.Seek(0)
             $src = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($mem)
             $target = Join-Path $OutDir ("page-{0:D2}.png" -f ($i + 1))
             $fs = [IO.File]::Create($target)
             try { $src.CopyTo($fs) } finally { $fs.Dispose(); $src.Dispose(); $mem.Dispose() }
             $out += $target
+            Write-RGTrace "saved $target"
         } finally { $page.Dispose() }
     }
     $ras.Dispose(); $netStream.Dispose()

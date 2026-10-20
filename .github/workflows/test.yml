@@ -20,7 +20,13 @@ jobs:
           if ($bad) { exit 1 }
       - name: Self-tests (Windows PowerShell 5.1)
         shell: powershell
-        run: ./tests/Run-Tests.ps1
+        env:
+          RG_TRACE: '1'
+        run: |
+          ./tests/Run-Tests.ps1 *>&1 | Tee-Object -FilePath out.txt
+          $code = $LASTEXITCODE
+          Get-Content out.txt | Select-Object -Last 15 | ForEach-Object { Write-Host "::notice::$_" }
+          exit $code
       - name: Self-tests (PowerShell 7)
         shell: pwsh
         run: ./tests/Run-Tests.ps1
