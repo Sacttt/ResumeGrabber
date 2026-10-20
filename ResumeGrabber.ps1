@@ -66,6 +66,7 @@ $IconFont = New-Object Windows.Media.FontFamily 'Segoe Fluent Icons, Segoe MDL2 
 # ======================================================================= helpers
 function Set-Status([string]$Text, [string]$Kind = 'info') {
     $W.StatusText.Text = $Text
+    $W.StatusText.ToolTip = $Text
     switch ($Kind) {
         'ok'    { $W.StatusIcon.Text = [string][char]0xE73E; $W.StatusIcon.Foreground = $Brush.Green }
         'error' { $W.StatusIcon.Text = [string][char]0xE783; $W.StatusIcon.Foreground = $Brush.Red }

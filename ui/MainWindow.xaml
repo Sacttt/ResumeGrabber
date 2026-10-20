@@ -124,7 +124,7 @@
           <ControlTemplate TargetType="RadioButton">
             <Grid>
               <Border x:Name="bg" Background="Transparent" CornerRadius="6" Padding="14,11">
-                <ContentPresenter/>
+                <ContentPresenter HorizontalAlignment="Stretch"/>
               </Border>
               <Border x:Name="pill" Width="3" Height="18" CornerRadius="2" Background="#4CC2FF"
                       HorizontalAlignment="Left" Visibility="Collapsed"/>
@@ -270,7 +270,7 @@
             </StackPanel>
           </RadioButton>
           <RadioButton x:Name="NavPreview" Style="{StaticResource Nav}">
-            <Grid Width="200">
+            <Grid>
               <StackPanel Orientation="Horizontal">
                 <TextBlock Text="&#xE8B9;" Style="{StaticResource Icon}" Margin="0,0,16,0"/>
                 <TextBlock Text="Preview" VerticalAlignment="Center"/>
